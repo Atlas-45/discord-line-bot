@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Context as AnyhowContext, Result};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -43,11 +43,7 @@ async fn main() -> Result<()> {
 
     init_db(&db).await?;
 
-    let state = Arc::new(AppState {
-        config,
-        http,
-        db,
-    });
+    let state = Arc::new(AppState { config, http, db });
 
     let app = Router::new()
         .route("/line/webhook", post(line_webhook))
@@ -60,9 +56,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILDS;
+    let intents =
+        GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT | GatewayIntents::GUILDS;
 
     let handler = DiscordHandler {
         state: state.clone(),
@@ -99,7 +94,8 @@ impl Config {
         let discord_bot_token = env_var("DISCORD_BOT_TOKEN")?;
         let discord_channel_id = env_var("DISCORD_CHANNEL_ID")?.parse::<u64>()?;
         let discord_webhook_url = std::env::var("DISCORD_WEBHOOK_URL").ok();
-        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
+        let database_url =
+            std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
         let bind_addr = std::env::var("BIND_ADDR")
             .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
             .parse::<SocketAddr>()
@@ -298,7 +294,10 @@ async fn send_discord_message(state: &AppState, thread_id: u64, content: &str) -
     let response = state
         .http
         .post(url)
-        .header("Authorization", format!("Bot {}", state.config.discord_bot_token))
+        .header(
+            "Authorization",
+            format!("Bot {}", state.config.discord_bot_token),
+        )
         .json(&payload)
         .send()
         .await?;
@@ -326,7 +325,10 @@ async fn discord_create_thread(state: &AppState, name: &str) -> Result<u64> {
     let response = state
         .http
         .post(url)
-        .header("Authorization", format!("Bot {}", state.config.discord_bot_token))
+        .header(
+            "Authorization",
+            format!("Bot {}", state.config.discord_bot_token),
+        )
         .json(&payload)
         .send()
         .await?;
@@ -346,13 +348,12 @@ fn parse_discord_id(id: &str) -> Result<u64> {
 }
 
 async fn get_thread_id(db: &SqlitePool, source_type: &str, source_id: &str) -> Result<Option<u64>> {
-    let record = sqlx::query(
-        "SELECT thread_id FROM line_threads WHERE source_type = ? AND source_id = ?",
-    )
-    .bind(source_type)
-    .bind(source_id)
-    .fetch_optional(db)
-    .await?;
+    let record =
+        sqlx::query("SELECT thread_id FROM line_threads WHERE source_type = ? AND source_id = ?")
+            .bind(source_type)
+            .bind(source_id)
+            .fetch_optional(db)
+            .await?;
 
     let thread_id = match record {
         Some(row) => {
@@ -448,12 +449,10 @@ async fn get_line_source_by_thread(
     db: &SqlitePool,
     thread_id: u64,
 ) -> Result<Option<(String, String)>> {
-    let record = sqlx::query(
-        "SELECT source_type, source_id FROM line_threads WHERE thread_id = ?",
-    )
-    .bind(thread_id.to_string())
-    .fetch_optional(db)
-    .await?;
+    let record = sqlx::query("SELECT source_type, source_id FROM line_threads WHERE thread_id = ?")
+        .bind(thread_id.to_string())
+        .fetch_optional(db)
+        .await?;
 
     let mapping = match record {
         Some(row) => Some((row.try_get("source_type")?, row.try_get("source_id")?)),
@@ -672,7 +671,8 @@ impl EventHandler for DiscordHandler {
             }
         };
 
-        if let Err(err) = send_line_from_discord(&self.state, thread_id, &source, &msg.content).await
+        if let Err(err) =
+            send_line_from_discord(&self.state, thread_id, &source, &msg.content).await
         {
             error!(?err, "failed to send line reply");
         }
