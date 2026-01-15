@@ -1,0 +1,18 @@
+[Unit]
+Description=Discord LINE Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/discord-line
+EnvironmentFile=/opt/discord-line/.env
+Environment=RUST_LOG=info
+ExecStart=/opt/discord-line/discord-line
+Restart=on-failure
+RestartSec=5
+User=discord-line
+Group=discord-line
+
+[Install]
+WantedBy=multi-user.target
