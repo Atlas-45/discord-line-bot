@@ -253,10 +253,11 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
         store_reply_token(&state.db, thread_id, &reply_token).await?;
     }
 
-    send_discord_message(&state, thread_id, &text).await?;
+    let timestamp = format_line_timestamp(event.timestamp);
+    let thread_content = format!("{}\nTime: {}", text, timestamp);
+    send_discord_message(&state, thread_id, &thread_content).await?;
 
     if let Some(notify_channel_id) = state.config.discord_notify_channel_id {
-        let timestamp = format_line_timestamp(event.timestamp);
         let summary = format!(
             "LINE: {}\nTime: {}\nThread: <#{}>",
             text, timestamp, thread_id
