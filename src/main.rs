@@ -11,6 +11,7 @@ use axum::routing::post;
 use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,7 @@ struct Config {
     discord_bot_token: String,
     discord_channel_id: u64,
     discord_webhook_url: Option<String>,
+    discord_notify_channel_id: Option<u64>,
     database_url: String,
     bind_addr: SocketAddr,
 }
@@ -94,6 +96,14 @@ impl Config {
         let discord_bot_token = env_var("DISCORD_BOT_TOKEN")?;
         let discord_channel_id = env_var("DISCORD_CHANNEL_ID")?.parse::<u64>()?;
         let discord_webhook_url = std::env::var("DISCORD_WEBHOOK_URL").ok();
+        let discord_notify_channel_id = match std::env::var("DISCORD_NOTIFY_CHANNEL_ID") {
+            Ok(value) => Some(
+                value
+                    .parse::<u64>()
+                    .context("parse DISCORD_NOTIFY_CHANNEL_ID")?,
+            ),
+            Err(_) => None,
+        };
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
         let bind_addr = std::env::var("BIND_ADDR")
@@ -107,6 +117,7 @@ impl Config {
             discord_bot_token,
             discord_channel_id,
             discord_webhook_url,
+            discord_notify_channel_id,
             database_url,
             bind_addr,
         })
@@ -243,6 +254,16 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
     }
 
     send_discord_message(&state, thread_id, &text).await?;
+
+    if let Some(notify_channel_id) = state.config.discord_notify_channel_id {
+        let timestamp = format_line_timestamp(event.timestamp);
+        let summary = format!(
+            "LINE: {}\nTime: {}\nThread: <#{}>",
+            text, timestamp, thread_id
+        );
+        send_discord_channel_message(&state, notify_channel_id, &summary).await?;
+    }
+
     Ok(())
 }
 
@@ -277,9 +298,8 @@ fn short_id(source_id: &str) -> String {
 }
 
 async fn send_discord_message(state: &AppState, thread_id: u64, content: &str) -> Result<()> {
-    let payload = json!({ "content": content });
-
     if let Some(webhook_url) = &state.config.discord_webhook_url {
+        let payload = json!({ "content": content });
         let url = format!("{webhook_url}?thread_id={thread_id}");
         let response = state.http.post(url).json(&payload).send().await?;
         if response.status().is_success() {
@@ -290,7 +310,16 @@ async fn send_discord_message(state: &AppState, thread_id: u64, content: &str) -
         return Err(anyhow!("discord webhook error {status}: {body}"));
     }
 
-    let url = format!("https://discord.com/api/v10/channels/{thread_id}/messages");
+    send_discord_channel_message(state, thread_id, content).await
+}
+
+async fn send_discord_channel_message(
+    state: &AppState,
+    channel_id: u64,
+    content: &str,
+) -> Result<()> {
+    let payload = json!({ "content": content });
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
     let response = state
         .http
         .post(url)
@@ -533,6 +562,20 @@ fn now_ts() -> i64 {
         .unwrap_or_default()
 }
 
+fn format_line_timestamp(timestamp_ms: Option<i64>) -> String {
+    let Some(timestamp_ms) = timestamp_ms else {
+        return "unknown".to_string();
+    };
+
+    let Some(naive) = NaiveDateTime::from_timestamp_millis(timestamp_ms) else {
+        return timestamp_ms.to_string();
+    };
+
+    let utc: DateTime<Utc> = DateTime::from_utc(naive, Utc);
+    let jst = utc.with_timezone(&FixedOffset::east_opt(9 * 3600).unwrap());
+    jst.format("%Y-%m-%d %H:%M:%S %:z").to_string()
+}
+
 #[derive(Deserialize)]
 struct LineWebhookRequest {
     events: Vec<LineEvent>,
@@ -547,6 +590,7 @@ struct LineEvent {
     source: LineSource,
     message: Option<LineMessage>,
     webhook_event_id: Option<String>,
+    timestamp: Option<i64>,
 }
 
 #[derive(Deserialize)]
