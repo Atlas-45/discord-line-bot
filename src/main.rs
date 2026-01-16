@@ -731,17 +731,30 @@ async fn send_line_from_discord(
 ) -> Result<()> {
     let target = &source.1;
 
+    let mut push_method = "push";
+
     if let Some(reply_token) = latest_reply_token(&state.db, thread_id).await? {
         let outcome = send_line_reply(state, &reply_token, content).await?;
         mark_reply_token_used(&state.db, &reply_token).await?;
 
         match outcome {
-            LineReplyOutcome::Sent => return Ok(()),
+            LineReplyOutcome::Sent => {
+                send_api_notice(state, thread_id, "reply").await?;
+                return Ok(());
+            }
             LineReplyOutcome::InvalidToken => {
-                info!("reply token invalid, falling back to push")
+                info!("reply token invalid, falling back to push");
+                push_method = "push (fallback)";
             }
         }
     }
 
-    send_line_push(state, target, content).await
+    send_line_push(state, target, content).await?;
+    send_api_notice(state, thread_id, push_method).await?;
+    Ok(())
+}
+
+async fn send_api_notice(state: &AppState, thread_id: u64, method: &str) -> Result<()> {
+    let notice = format!("API: {method}");
+    send_discord_channel_message(state, thread_id, &notice).await
 }
