@@ -82,6 +82,7 @@ struct Config {
     line_channel_secret: String,
     line_channel_access_token: String,
     discord_bot_token: String,
+    discord_guild_id: u64,
     discord_channel_id: u64,
     discord_webhook_url: Option<String>,
     discord_notify_channel_id: Option<u64>,
@@ -94,6 +95,7 @@ impl Config {
         let line_channel_secret = env_var("LINE_CHANNEL_SECRET")?;
         let line_channel_access_token = env_var("LINE_CHANNEL_ACCESS_TOKEN")?;
         let discord_bot_token = env_var("DISCORD_BOT_TOKEN")?;
+        let discord_guild_id = env_var("DISCORD_GUILD_ID")?.parse::<u64>()?;
         let discord_channel_id = env_var("DISCORD_CHANNEL_ID")?.parse::<u64>()?;
         let discord_webhook_url = std::env::var("DISCORD_WEBHOOK_URL").ok();
         let discord_notify_channel_id = match std::env::var("DISCORD_NOTIFY_CHANNEL_ID") {
@@ -115,6 +117,7 @@ impl Config {
             line_channel_secret,
             line_channel_access_token,
             discord_bot_token,
+            discord_guild_id,
             discord_channel_id,
             discord_webhook_url,
             discord_notify_channel_id,
@@ -211,8 +214,11 @@ fn verify_line_signature(secret: &str, body: &[u8], signature: &str) -> bool {
         Err(_) => return false,
     };
     mac.update(body);
-    let expected = STANDARD.encode(mac.finalize().into_bytes());
-    expected == signature
+    let decoded = match STANDARD.decode(signature) {
+        Ok(decoded) => decoded,
+        Err(_) => return false,
+    };
+    mac.verify_slice(&decoded).is_ok()
 }
 
 async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()> {
@@ -255,12 +261,31 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
 
     let timestamp = format_line_timestamp(event.timestamp);
     let thread_content = format!("{}\nTime: {}", text, timestamp);
-    send_discord_message(&state, thread_id, &thread_content).await?;
+    let message_id = send_discord_message(&state, thread_id, &thread_content).await?;
 
     if let Some(notify_channel_id) = state.config.discord_notify_channel_id {
+        let guild_id = state.config.discord_guild_id;
+        let message_link = format!(
+            "https://discord.com/channels/{}/{}/{}",
+            guild_id, thread_id, message_id
+        );
         let summary = format!(
-            "LINE: {}\nTime: {}\nThread: <#{}>",
-            text, timestamp, thread_id
+            "{}
+{}
+> {}
+
+{} {}
+{} [{}]({})
+{}",
+            "\u{1F4E9} **LINE \u{30E1}\u{30C3}\u{30BB}\u{30FC}\u{30B8}\u{53D7}\u{4FE1}**",
+            "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}",
+            text,
+            "\u{1F550}",
+            timestamp,
+            "\u{1F517}",
+            "\u{30E1}\u{30C3}\u{30BB}\u{30FC}\u{30B8}\u{3092}\u{898B}\u{308B}",
+            message_link,
+            "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
         );
         send_discord_channel_message(&state, notify_channel_id, &summary).await?;
     }
@@ -298,20 +323,22 @@ fn short_id(source_id: &str) -> String {
     }
 }
 
-async fn send_discord_message(state: &AppState, thread_id: u64, content: &str) -> Result<()> {
+async fn send_discord_message(state: &AppState, thread_id: u64, content: &str) -> Result<u64> {
     if let Some(webhook_url) = &state.config.discord_webhook_url {
         let payload = json!({ "content": content });
-        let url = format!("{webhook_url}?thread_id={thread_id}");
+        let url = format!("{webhook_url}?thread_id={thread_id}&wait=true");
         let response = state.http.post(url).json(&payload).send().await?;
         if response.status().is_success() {
-            return Ok(());
+            let body = response.text().await.unwrap_or_default();
+            let msg: DiscordMessageResponse = serde_json::from_str(&body)?;
+            return Ok(parse_discord_id(&msg.id)?);
         }
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(anyhow!("discord webhook error {status}: {body}"));
     }
 
-    send_discord_channel_message(state, thread_id, content).await
+    send_discord_channel_message_with_id(state, thread_id, content).await
 }
 
 async fn send_discord_channel_message(
@@ -319,6 +346,15 @@ async fn send_discord_channel_message(
     channel_id: u64,
     content: &str,
 ) -> Result<()> {
+    send_discord_channel_message_with_id(state, channel_id, content).await?;
+    Ok(())
+}
+
+async fn send_discord_channel_message_with_id(
+    state: &AppState,
+    channel_id: u64,
+    content: &str,
+) -> Result<u64> {
     let payload = json!({ "content": content });
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
     let response = state
@@ -333,7 +369,9 @@ async fn send_discord_channel_message(
         .await?;
 
     if response.status().is_success() {
-        return Ok(());
+        let body = response.text().await.unwrap_or_default();
+        let msg: DiscordMessageResponse = serde_json::from_str(&body)?;
+        return Ok(parse_discord_id(&msg.id)?);
     }
 
     let status = response.status();
@@ -654,6 +692,11 @@ impl<'a> LineTextMessage<'a> {
 
 #[derive(Deserialize)]
 struct DiscordChannelResponse {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct DiscordMessageResponse {
     id: String,
 }
 
