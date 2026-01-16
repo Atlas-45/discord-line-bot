@@ -1,3 +1,4 @@
 /target
 data.sqlite
 .env
+.DS_Store
