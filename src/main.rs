@@ -11,7 +11,7 @@ use axum::routing::post;
 use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -567,11 +567,10 @@ fn format_line_timestamp(timestamp_ms: Option<i64>) -> String {
         return "unknown".to_string();
     };
 
-    let Some(naive) = NaiveDateTime::from_timestamp_millis(timestamp_ms) else {
+    let Some(utc) = DateTime::<Utc>::from_timestamp_millis(timestamp_ms) else {
         return timestamp_ms.to_string();
     };
 
-    let utc: DateTime<Utc> = DateTime::from_utc(naive, Utc);
     let jst = utc.with_timezone(&FixedOffset::east_opt(9 * 3600).unwrap());
     jst.format("%Y-%m-%d %H:%M:%S %:z").to_string()
 }
