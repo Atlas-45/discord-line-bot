@@ -269,25 +269,26 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
             "https://discord.com/channels/{}/{}/{}",
             guild_id, thread_id, message_id
         );
-        let summary = format!(
-            "{}
-{}
-> {}
+        let message_url = message_link.clone();
+        let message_field = format!("[Open message]({})", message_link);
+        let mut embed = json!({
+            "title": "LINE message received",
+            "url": message_url,
+            "description": text,
+            "fields": [
+                { "name": "Time", "value": timestamp, "inline": true },
+                { "name": "Thread", "value": format!("<#{}>", thread_id), "inline": true },
+                { "name": "Message link", "value": message_field, "inline": false }
+            ]
+        });
 
-{} {}
-{} [{}]({})
-{}",
-            "\u{1F4E9} **LINE \u{30E1}\u{30C3}\u{30BB}\u{30FC}\u{30B8}\u{53D7}\u{4FE1}**",
-            "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}",
-            text,
-            "\u{1F550}",
-            timestamp,
-            "\u{1F517}",
-            "\u{30E1}\u{30C3}\u{30BB}\u{30FC}\u{30B8}\u{3092}\u{898B}\u{308B}",
-            message_link,
-            "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
-        );
-        send_discord_channel_message(&state, notify_channel_id, &summary).await?;
+        if let Some(rfc3339) = line_timestamp_rfc3339(event.timestamp) {
+            if let Some(embed_obj) = embed.as_object_mut() {
+                embed_obj.insert("timestamp".to_string(), json!(rfc3339));
+            }
+        }
+
+        send_discord_channel_embed(&state, notify_channel_id, embed).await?;
     }
 
     Ok(())
@@ -348,6 +349,33 @@ async fn send_discord_channel_message(
 ) -> Result<()> {
     send_discord_channel_message_with_id(state, channel_id, content).await?;
     Ok(())
+}
+
+async fn send_discord_channel_embed(
+    state: &AppState,
+    channel_id: u64,
+    embed: serde_json::Value,
+) -> Result<()> {
+    let payload = json!({ "embeds": [embed] });
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+    let response = state
+        .http
+        .post(url)
+        .header(
+            "Authorization",
+            format!("Bot {}", state.config.discord_bot_token),
+        )
+        .json(&payload)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(anyhow!("discord message error {status}: {body}"))
 }
 
 async fn send_discord_channel_message_with_id(
@@ -611,7 +639,13 @@ fn format_line_timestamp(timestamp_ms: Option<i64>) -> String {
     };
 
     let jst = utc.with_timezone(&FixedOffset::east_opt(9 * 3600).unwrap());
-    jst.format("%Y-%m-%d %H:%M:%S %:z").to_string()
+    jst.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn line_timestamp_rfc3339(timestamp_ms: Option<i64>) -> Option<String> {
+    let timestamp_ms = timestamp_ms?;
+    let utc = DateTime::<Utc>::from_timestamp_millis(timestamp_ms)?;
+    Some(utc.to_rfc3339())
 }
 
 #[derive(Deserialize)]
