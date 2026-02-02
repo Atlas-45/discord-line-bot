@@ -17,15 +17,36 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serenity::async_trait;
+use serenity::builder::{
+    CreateActionRow,
+    CreateButton,
+    CreateCommand,
+    CreateInteractionResponse,
+    CreateInteractionResponseMessage,
+    CreateMessage,
+};
 use serenity::model::channel::ChannelType;
-use serenity::model::prelude::{Channel, Message};
+use serenity::model::gateway::Ready;
+use serenity::model::prelude::{
+    ButtonStyle,
+    Channel,
+    ChannelId,
+    GuildId,
+    Interaction,
+    Message,
+    ReactionType,
+};
 use serenity::prelude::*;
 use sha2::Sha256;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_DATABASE_URL: &str = "sqlite://data.sqlite";
+const UNRESOLVED_PREFIX: &str = "🟢【未対応】";
+const BUTTON_SEND_ID: &str = "line_send";
+const BUTTON_DELETE_ID: &str = "line_delete";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,8 +81,10 @@ async fn main() -> Result<()> {
     let intents =
         GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT | GatewayIntents::GUILDS;
 
+    let bot_user_id = Arc::new(RwLock::new(None));
     let handler = DiscordHandler {
         state: state.clone(),
+        bot_user_id,
     };
 
     let mut client = serenity::Client::builder(&state.config.discord_bot_token, intents)
@@ -253,7 +276,7 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
         None => return Ok(()),
     };
 
-    let thread_id = ensure_discord_thread(&state, &source_type, &source_id).await?;
+    let thread_id = ensure_discord_thread(&state, &source_type, &source_id, event.timestamp).await?;
 
     if let Some(reply_token) = event.reply_token {
         store_reply_token(&state.db, thread_id, &reply_token).await?;
@@ -291,6 +314,10 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
         send_discord_channel_embed(&state, notify_channel_id, embed).await?;
     }
 
+    if let Err(err) = mark_discord_thread_unresolved(&state, thread_id).await {
+        warn!(?err, "failed to mark discord thread unresolved");
+    }
+
     Ok(())
 }
 
@@ -298,12 +325,21 @@ async fn ensure_discord_thread(
     state: &AppState,
     source_type: &str,
     source_id: &str,
+    timestamp_ms: Option<i64>,
 ) -> Result<u64> {
     if let Some(thread_id) = get_thread_id(&state.db, source_type, source_id).await? {
         return Ok(thread_id);
     }
 
-    let thread_name = format!("LINE-{}", short_id(source_id));
+    let display_name = if source_type == "user" {
+        fetch_line_profile_name(state, source_id).await?
+    } else {
+        None
+    };
+    let display_name = display_name.unwrap_or_else(|| short_id(source_id));
+    let timestamp = format_thread_timestamp(timestamp_ms);
+    let base_name = format!("{timestamp}-{display_name}");
+    let thread_name = truncate_discord_name(&mark_unresolved_name(&base_name));
     let thread_id = discord_create_thread(state, &thread_name).await?;
 
     upsert_thread(&state.db, source_type, source_id, thread_id).await?;
@@ -322,6 +358,52 @@ fn short_id(source_id: &str) -> String {
     } else {
         source_id[source_id.len() - 6..].to_string()
     }
+}
+
+fn format_thread_timestamp(timestamp_ms: Option<i64>) -> String {
+    let utc = match timestamp_ms {
+        Some(value) => DateTime::<Utc>::from_timestamp_millis(value).unwrap_or_else(Utc::now),
+        None => Utc::now(),
+    };
+    let jst = utc.with_timezone(&FixedOffset::east_opt(9 * 3600).unwrap());
+    jst.format("%m/%d %H:%M").to_string()
+}
+
+fn is_unresolved_thread_name(name: &str) -> bool {
+    name.starts_with(UNRESOLVED_PREFIX)
+}
+
+fn mark_unresolved_name(name: &str) -> String {
+    if is_unresolved_thread_name(name) {
+        name.to_string()
+    } else {
+        format!("{UNRESOLVED_PREFIX}{name}")
+    }
+}
+
+fn mark_resolved_name(name: &str) -> String {
+    if is_unresolved_thread_name(name) {
+        name.replacen(UNRESOLVED_PREFIX, "", 1)
+    } else {
+        name.to_string()
+    }
+}
+
+fn truncate_discord_name(name: &str) -> String {
+    let limit = 100;
+    if name.chars().count() <= limit {
+        return name.to_string();
+    }
+    name.chars().take(limit).collect()
+}
+
+fn strip_bot_mention(content: &str, bot_id: u64) -> String {
+    let mention = format!("<@{bot_id}>");
+    let mention_nick = format!("<@!{bot_id}>");
+    let cleaned = content
+        .replace(&mention, " ")
+        .replace(&mention_nick, " ");
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 async fn send_discord_message(state: &AppState, thread_id: u64, content: &str) -> Result<u64> {
@@ -437,6 +519,79 @@ async fn discord_create_thread(state: &AppState, name: &str) -> Result<u64> {
 
     let channel: DiscordChannelResponse = serde_json::from_str(&body)?;
     Ok(parse_discord_id(&channel.id)?)
+}
+
+async fn fetch_discord_channel_name(state: &AppState, channel_id: u64) -> Result<Option<String>> {
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}");
+    let response = state
+        .http
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Bot {}", state.config.discord_bot_token),
+        )
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let channel: DiscordChannelResponse = response.json().await?;
+        return Ok(channel.name);
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(anyhow!("discord channel fetch error {status}: {body}"))
+}
+
+async fn update_discord_thread_name(
+    state: &AppState,
+    thread_id: u64,
+    name: &str,
+) -> Result<()> {
+    let url = format!("https://discord.com/api/v10/channels/{thread_id}");
+    let payload = json!({ "name": name });
+    let response = state
+        .http
+        .patch(url)
+        .header(
+            "Authorization",
+            format!("Bot {}", state.config.discord_bot_token),
+        )
+        .json(&payload)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(anyhow!("discord thread update error {status}: {body}"))
+}
+
+async fn mark_discord_thread_unresolved(state: &AppState, thread_id: u64) -> Result<()> {
+    let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
+        return Ok(());
+    };
+    if is_unresolved_thread_name(&current_name) {
+        return Ok(());
+    }
+    let next = truncate_discord_name(&mark_unresolved_name(&current_name));
+    update_discord_thread_name(state, thread_id, &next).await?;
+    Ok(())
+}
+
+async fn mark_discord_thread_resolved(state: &AppState, thread_id: u64) -> Result<()> {
+    let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
+        return Ok(());
+    };
+    if !is_unresolved_thread_name(&current_name) {
+        return Ok(());
+    }
+    let next = truncate_discord_name(&mark_resolved_name(&current_name));
+    update_discord_thread_name(state, thread_id, &next).await?;
+    Ok(())
 }
 
 fn parse_discord_id(id: &str) -> Result<u64> {
@@ -556,6 +711,37 @@ async fn get_line_source_by_thread(
     };
 
     Ok(mapping)
+}
+
+async fn delete_thread_mapping_by_thread_id(db: &SqlitePool, thread_id: u64) -> Result<()> {
+    sqlx::query("DELETE FROM line_threads WHERE thread_id = ?")
+        .bind(thread_id.to_string())
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn fetch_line_profile_name(state: &AppState, user_id: &str) -> Result<Option<String>> {
+    let url = format!("https://api.line.me/v2/bot/profile/{user_id}");
+    let response = state
+        .http
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", state.config.line_channel_access_token),
+        )
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let profile: LineProfileResponse = response.json().await?;
+        return Ok(Some(profile.display_name.replace('/', "")));
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    warn!(?status, body, "failed to fetch line profile");
+    Ok(None)
 }
 
 async fn send_line_reply(
@@ -708,6 +894,12 @@ struct LinePushRequest<'a> {
     messages: Vec<LineTextMessage<'a>>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LineProfileResponse {
+    display_name: String,
+}
+
 #[derive(Serialize)]
 struct LineTextMessage<'a> {
     #[serde(rename = "type")]
@@ -727,6 +919,7 @@ impl<'a> LineTextMessage<'a> {
 #[derive(Deserialize)]
 struct DiscordChannelResponse {
     id: String,
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -739,12 +932,270 @@ enum LineReplyOutcome {
     InvalidToken,
 }
 
+async fn resolve_thread_id(
+    ctx: &Context,
+    channel_id: ChannelId,
+    parent_channel_id: u64,
+) -> Result<Option<u64>> {
+    let channel = match channel_id.to_channel(&ctx.http).await {
+        Ok(channel) => channel,
+        Err(err) => {
+            warn!(?err, "failed to fetch channel");
+            return Ok(None);
+        }
+    };
+
+    let thread_id = match channel {
+        Channel::Guild(channel) => {
+            let is_thread = matches!(
+                channel.kind,
+                ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread
+            );
+            if !is_thread {
+                return Ok(None);
+            }
+            let parent_id = channel.parent_id.map(|id| id.get());
+            if parent_id != Some(parent_channel_id) {
+                return Ok(None);
+            }
+            channel.id.get()
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(thread_id))
+}
+
+async fn register_guild_commands(ctx: &Context, guild_id: u64) -> Result<()> {
+    let guild_id = GuildId::new(guild_id);
+    let commands = vec![
+        CreateCommand::new("resolve").description("スレッドを対応済みにします。"),
+        CreateCommand::new("close").description("スレッドを対応済みにして終了します。"),
+        CreateCommand::new("unresolved").description("未対応スレッドを一覧します。"),
+    ];
+
+    guild_id.set_commands(&ctx.http, commands).await?;
+    Ok(())
+}
+
+async fn handle_command_interaction(
+    ctx: &Context,
+    state: &AppState,
+    interaction: serenity::model::application::CommandInteraction,
+) -> Result<()> {
+    let command = interaction.data.name.as_str();
+    match command {
+        "resolve" | "close" => {
+            let thread_id = match resolve_thread_id(
+                ctx,
+                interaction.channel_id,
+                state.config.discord_channel_id,
+            )
+            .await?
+            {
+                Some(thread_id) => thread_id,
+                None => {
+                    let message = CreateInteractionResponseMessage::new()
+                        .content(":question: 不明なスレッド");
+                    interaction
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(message),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
+
+            if command == "close" {
+                delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
+            }
+
+            if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
+                warn!(?err, "failed to mark discord thread resolved");
+            }
+
+            let message =
+                CreateInteractionResponseMessage::new().content(":white_check_mark: 完了");
+            interaction
+                .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+                .await?;
+        }
+        "unresolved" => {
+            let guild_id = GuildId::new(state.config.discord_guild_id);
+            let threads = guild_id.get_active_threads(&ctx.http).await?;
+            let parent_id = ChannelId::new(state.config.discord_channel_id);
+            let mut unresolved = Vec::new();
+            for thread in threads.threads {
+                if thread.parent_id != Some(parent_id) {
+                    continue;
+                }
+                if !is_unresolved_thread_name(&thread.name) {
+                    continue;
+                }
+                unresolved.push(format!("<#{}>", thread.id.get()));
+            }
+
+            let content = if unresolved.is_empty() {
+                ":smiling_face_with_3_hearts: すべての問い合わせに対応済みです。".to_string()
+            } else {
+                unresolved
+                    .into_iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
+            let message = CreateInteractionResponseMessage::new().content(content);
+            interaction
+                .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+                .await?;
+        }
+        _ => {
+            let message =
+                CreateInteractionResponseMessage::new().content(":question: 不明なコマンド");
+            interaction
+                .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_component_interaction(
+    ctx: &Context,
+    state: &AppState,
+    interaction: serenity::model::application::ComponentInteraction,
+    bot_user_id: Arc<RwLock<Option<u64>>>,
+) -> Result<()> {
+    let custom_id = interaction.data.custom_id.as_str();
+    if custom_id != BUTTON_SEND_ID && custom_id != BUTTON_DELETE_ID {
+        return Ok(());
+    }
+
+    interaction
+        .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+        .await?;
+
+    if custom_id == BUTTON_DELETE_ID {
+        if let Err(err) = interaction.message.delete(&ctx.http).await {
+            warn!(?err, "failed to delete confirmation message");
+        }
+        return Ok(());
+    }
+
+    let thread_id = match resolve_thread_id(
+        ctx,
+        interaction.channel_id,
+        state.config.discord_channel_id,
+    )
+    .await?
+    {
+        Some(thread_id) => thread_id,
+        None => {
+            send_discord_channel_message(state, interaction.channel_id.get(), "不明なスレッドです。")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let Some(reference) = interaction.message.message_reference.as_ref() else {
+        send_discord_channel_message(state, thread_id, "送信するメッセージを取得できません。")
+            .await?;
+        return Ok(());
+    };
+
+    let Some(reference_id) = reference.message_id else {
+        send_discord_channel_message(state, thread_id, "送信するメッセージを取得できません。")
+            .await?;
+        return Ok(());
+    };
+
+    let original_message = match interaction
+        .channel_id
+        .message(&ctx.http, reference_id)
+        .await
+    {
+        Ok(message) => message,
+        Err(err) => {
+            warn!(?err, "failed to fetch referenced message");
+            send_discord_channel_message(state, thread_id, "送信するメッセージを取得できません。")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let bot_id = *bot_user_id.read().await;
+    let bot_id = match bot_id {
+        Some(id) => id,
+        None => {
+            send_discord_channel_message(state, thread_id, "送信先情報が準備できていません。")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let content = strip_bot_mention(&original_message.content, bot_id);
+    if content.is_empty() {
+        send_discord_channel_message(state, thread_id, "送信する本文がありません。").await?;
+        return Ok(());
+    }
+
+    let source = match get_line_source_by_thread(&state.db, thread_id).await {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            send_discord_channel_message(state, thread_id, "送信先ユーザーを取得できません。")
+                .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            error!(?err, "failed to load line mapping");
+            send_discord_channel_message(state, thread_id, "送信先ユーザーを取得できません。")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    match send_line_from_discord(state, thread_id, &source, &content).await {
+        Ok(()) => {
+            send_discord_channel_message(state, thread_id, "送信しました。").await?;
+        }
+        Err(err) => {
+            send_discord_channel_message(
+                state,
+                thread_id,
+                &format!("メッセージを送信できません: {}", err),
+            )
+            .await?;
+        }
+    }
+
+    if let Err(err) = interaction.message.delete(&ctx.http).await {
+        warn!(?err, "failed to delete confirmation message");
+    }
+
+    Ok(())
+}
+
 struct DiscordHandler {
     state: Arc<AppState>,
+    bot_user_id: Arc<RwLock<Option<u64>>>,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        {
+            let mut guard = self.bot_user_id.write().await;
+            *guard = Some(ready.user.id.get());
+        }
+
+        if let Err(err) = register_guild_commands(&ctx, self.state.config.discord_guild_id).await {
+            error!(?err, "failed to register discord commands");
+        }
+    }
+
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot || msg.webhook_id.is_some() {
             return;
@@ -754,48 +1205,90 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let channel = match msg.channel_id.to_channel(&ctx.http).await {
-            Ok(channel) => channel,
-            Err(err) => {
-                warn!(?err, "failed to fetch channel");
-                return;
-            }
-        };
-
-        let thread_id = match channel {
-            Channel::Guild(channel) => {
-                let is_thread = matches!(
-                    channel.kind,
-                    ChannelType::PublicThread | ChannelType::PrivateThread
-                );
-                if !is_thread {
-                    return;
-                }
-                let parent_id = channel.parent_id.map(|id| id.get());
-                if parent_id != Some(self.state.config.discord_channel_id) {
-                    return;
-                }
-                channel.id.get()
-            }
-            _ => return,
-        };
-
-        let source = match get_line_source_by_thread(&self.state.db, thread_id).await {
-            Ok(Some(source)) => source,
-            Ok(None) => {
-                warn!(thread_id, "no line mapping for thread");
-                return;
-            }
-            Err(err) => {
-                error!(?err, "failed to load line mapping");
-                return;
-            }
-        };
-
-        if let Err(err) =
-            send_line_from_discord(&self.state, thread_id, &source, &msg.content).await
+        let _thread_id = match resolve_thread_id(
+            &ctx,
+            msg.channel_id,
+            self.state.config.discord_channel_id,
+        )
+        .await
         {
-            error!(?err, "failed to send line reply");
+            Ok(Some(thread_id)) => thread_id,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(?err, "failed to resolve thread id");
+                return;
+            }
+        };
+
+        let bot_id = *self.bot_user_id.read().await;
+        let bot_id = match bot_id {
+            Some(id) => id,
+            None => {
+                warn!("bot user id not ready");
+                return;
+            }
+        };
+
+        let has_mention = msg.mentions.iter().any(|user| user.id.get() == bot_id);
+        if !has_mention {
+            return;
+        }
+
+        let stripped = strip_bot_mention(&msg.content, bot_id);
+        if stripped.is_empty() {
+            let _ = msg
+                .channel_id
+                .send_message(
+                    &ctx.http,
+                    CreateMessage::new().content("送信する本文がありません。"),
+                )
+                .await;
+            return;
+        }
+
+        let mut prompt = "このメッセージを送信しますか？".to_string();
+        if !msg.attachments.is_empty() {
+            prompt.push_str("\n※添付は送信されません。");
+        }
+
+        let send_button = CreateButton::new(BUTTON_SEND_ID)
+            .label("送信")
+            .style(ButtonStyle::Primary);
+        let delete_button = CreateButton::new(BUTTON_DELETE_ID)
+            .emoji(ReactionType::Unicode("🗑️".to_string()))
+            .style(ButtonStyle::Secondary);
+        let row = CreateActionRow::Buttons(vec![send_button, delete_button]);
+
+        let message = CreateMessage::new()
+            .content(prompt)
+            .reference_message(&msg)
+            .components(vec![row]);
+
+        if let Err(err) = msg.channel_id.send_message(&ctx.http, message).await {
+            warn!(?err, "failed to send confirmation message");
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::Command(command) => {
+                if let Err(err) = handle_command_interaction(&ctx, &self.state, command).await {
+                    error!(?err, "failed to handle command interaction");
+                }
+            }
+            Interaction::Component(component) => {
+                if let Err(err) = handle_component_interaction(
+                    &ctx,
+                    &self.state,
+                    component,
+                    self.bot_user_id.clone(),
+                )
+                .await
+                {
+                    error!(?err, "failed to handle component interaction");
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -817,6 +1310,9 @@ async fn send_line_from_discord(
         match outcome {
             LineReplyOutcome::Sent => {
                 send_api_notice(state, thread_id, "reply").await?;
+                if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
+                    warn!(?err, "failed to mark discord thread resolved");
+                }
                 return Ok(());
             }
             LineReplyOutcome::InvalidToken => {
@@ -828,6 +1324,9 @@ async fn send_line_from_discord(
 
     send_line_push(state, target, content).await?;
     send_api_notice(state, thread_id, push_method).await?;
+    if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
+        warn!(?err, "failed to mark discord thread resolved");
+    }
     Ok(())
 }
 
