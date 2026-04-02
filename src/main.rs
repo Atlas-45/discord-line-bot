@@ -269,7 +269,7 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
         None => return Ok(()),
     };
 
-    let existing_thread_id = get_thread_id(&state.db, &source_type, &source_id).await?;
+    let existing_thread_id = get_active_thread_id(&state, &source_type, &source_id).await?;
     if !should_forward_to_discord(existing_thread_id.is_some(), &text) {
         return Ok(());
     }
@@ -332,7 +332,7 @@ async fn ensure_discord_thread(
     source_id: &str,
     timestamp_ms: Option<i64>,
 ) -> Result<u64> {
-    if let Some(thread_id) = get_thread_id(&state.db, source_type, source_id).await? {
+    if let Some(thread_id) = get_active_thread_id(state, source_type, source_id).await? {
         return Ok(thread_id);
     }
 
@@ -355,6 +355,30 @@ async fn ensure_discord_thread(
     }
 
     Ok(thread_id)
+}
+
+async fn get_active_thread_id(
+    state: &AppState,
+    source_type: &str,
+    source_id: &str,
+) -> Result<Option<u64>> {
+    let Some(thread_id) = get_thread_id(&state.db, source_type, source_id).await? else {
+        return Ok(None);
+    };
+
+    if fetch_discord_channel_name(state, thread_id)
+        .await?
+        .is_some()
+    {
+        return Ok(Some(thread_id));
+    }
+
+    warn!(
+        thread_id,
+        source_type, source_id, "discord thread missing, recreating mapping"
+    );
+    delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
+    Ok(None)
 }
 
 fn short_id(source_id: &str) -> String {
@@ -543,6 +567,9 @@ async fn fetch_discord_channel_name(state: &AppState, channel_id: u64) -> Result
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
+    if status == StatusCode::NOT_FOUND && body.contains("\"code\": 10003") {
+        return Ok(None);
+    }
     Err(anyhow!("discord channel fetch error {status}: {body}"))
 }
 
