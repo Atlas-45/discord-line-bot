@@ -24,19 +24,18 @@ use serenity::builder::{
 };
 use serenity::model::channel::ChannelType;
 use serenity::model::gateway::Ready;
-use serenity::model::prelude::{
-    ButtonStyle, Channel, ChannelId, GuildId, Interaction, Message, ReactionType,
-};
+use serenity::model::prelude::{ButtonStyle, Channel, ChannelId, GuildId, Interaction, Message};
 use serenity::prelude::*;
 use sha2::Sha256;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_DATABASE_URL: &str = "sqlite://data.sqlite";
 const UNRESOLVED_PREFIX: &str = "🟢【未対応】";
+const RESOLVED_PREFIX: &str = "🟡【解決】";
+const CLOSED_PREFIX: &str = "⚪️【終了】";
 const BUTTON_SEND_ID: &str = "line_send";
 const BUTTON_DELETE_ID: &str = "line_delete";
 
@@ -74,10 +73,8 @@ async fn main() -> Result<()> {
     let intents =
         GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT | GatewayIntents::GUILDS;
 
-    let bot_user_id = Arc::new(RwLock::new(None));
     let handler = DiscordHandler {
         state: state.clone(),
-        bot_user_id,
     };
 
     let mut client = serenity::Client::builder(&state.config.discord_bot_token, intents)
@@ -349,11 +346,6 @@ async fn ensure_discord_thread(
 
     upsert_thread(&state.db, source_type, source_id, thread_id).await?;
 
-    let intro = format!("LINE source: {source_type}");
-    if let Err(err) = send_discord_message(state, thread_id, &intro).await {
-        warn!(?err, "failed to send intro message to discord");
-    }
-
     Ok(thread_id)
 }
 
@@ -402,20 +394,25 @@ fn is_unresolved_thread_name(name: &str) -> bool {
     name.starts_with(UNRESOLVED_PREFIX)
 }
 
-fn mark_unresolved_name(name: &str) -> String {
-    if is_unresolved_thread_name(name) {
-        name.to_string()
-    } else {
-        format!("{UNRESOLVED_PREFIX}{name}")
+fn strip_thread_status_prefix(name: &str) -> &str {
+    for prefix in [UNRESOLVED_PREFIX, RESOLVED_PREFIX, CLOSED_PREFIX] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
     }
+    name
+}
+
+fn mark_unresolved_name(name: &str) -> String {
+    format!("{UNRESOLVED_PREFIX}{}", strip_thread_status_prefix(name))
 }
 
 fn mark_resolved_name(name: &str) -> String {
-    if is_unresolved_thread_name(name) {
-        name.replacen(UNRESOLVED_PREFIX, "", 1)
-    } else {
-        name.to_string()
-    }
+    format!("{RESOLVED_PREFIX}{}", strip_thread_status_prefix(name))
+}
+
+fn mark_closed_name(name: &str) -> String {
+    format!("{CLOSED_PREFIX}{}", strip_thread_status_prefix(name))
 }
 
 fn truncate_discord_name(name: &str) -> String {
@@ -426,11 +423,8 @@ fn truncate_discord_name(name: &str) -> String {
     name.chars().take(limit).collect()
 }
 
-fn strip_bot_mention(content: &str, bot_id: u64) -> String {
-    let mention = format!("<@{bot_id}>");
-    let mention_nick = format!("<@!{bot_id}>");
-    let cleaned = content.replace(&mention, " ").replace(&mention_nick, " ");
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+fn normalize_line_message(content: &str) -> String {
+    content.trim().to_string()
 }
 
 async fn send_discord_message(state: &AppState, thread_id: u64, content: &str) -> Result<u64> {
@@ -612,10 +606,22 @@ async fn mark_discord_thread_resolved(state: &AppState, thread_id: u64) -> Resul
     let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
         return Ok(());
     };
-    if !is_unresolved_thread_name(&current_name) {
+    let next = truncate_discord_name(&mark_resolved_name(&current_name));
+    if current_name == next {
         return Ok(());
     }
-    let next = truncate_discord_name(&mark_resolved_name(&current_name));
+    update_discord_thread_name(state, thread_id, &next).await?;
+    Ok(())
+}
+
+async fn mark_discord_thread_closed(state: &AppState, thread_id: u64) -> Result<()> {
+    let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
+        return Ok(());
+    };
+    let next = truncate_discord_name(&mark_closed_name(&current_name));
+    if current_name == next {
+        return Ok(());
+    }
     update_discord_thread_name(state, thread_id, &next).await?;
     Ok(())
 }
@@ -1032,9 +1038,10 @@ async fn handle_command_interaction(
 
             if command == "close" {
                 delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
-            }
-
-            if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
+                if let Err(err) = mark_discord_thread_closed(state, thread_id).await {
+                    warn!(?err, "failed to mark discord thread closed");
+                }
+            } else if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
                 warn!(?err, "failed to mark discord thread resolved");
             }
 
@@ -1090,7 +1097,6 @@ async fn handle_component_interaction(
     ctx: &Context,
     state: &AppState,
     interaction: serenity::model::application::ComponentInteraction,
-    bot_user_id: Arc<RwLock<Option<u64>>>,
 ) -> Result<()> {
     let custom_id = interaction.data.custom_id.as_str();
     if custom_id != BUTTON_SEND_ID && custom_id != BUTTON_DELETE_ID {
@@ -1104,6 +1110,15 @@ async fn handle_component_interaction(
     if custom_id == BUTTON_DELETE_ID {
         if let Err(err) = interaction.message.delete(&ctx.http).await {
             warn!(?err, "failed to delete confirmation message");
+        }
+        if let Err(err) = send_discord_channel_message(
+            state,
+            interaction.channel_id.get(),
+            "キャンセルしました。",
+        )
+        .await
+        {
+            warn!(?err, "failed to send cancel notice");
         }
         return Ok(());
     }
@@ -1150,17 +1165,7 @@ async fn handle_component_interaction(
         }
     };
 
-    let bot_id = *bot_user_id.read().await;
-    let bot_id = match bot_id {
-        Some(id) => id,
-        None => {
-            send_discord_channel_message(state, thread_id, "送信先情報が準備できていません。")
-                .await?;
-            return Ok(());
-        }
-    };
-
-    let content = strip_bot_mention(&original_message.content, bot_id);
+    let content = normalize_line_message(&original_message.content);
     if content.is_empty() {
         send_discord_channel_message(state, thread_id, "送信する本文がありません。").await?;
         return Ok(());
@@ -1204,17 +1209,11 @@ async fn handle_component_interaction(
 
 struct DiscordHandler {
     state: Arc<AppState>,
-    bot_user_id: Arc<RwLock<Option<u64>>>,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        {
-            let mut guard = self.bot_user_id.write().await;
-            *guard = Some(ready.user.id.get());
-        }
-
+    async fn ready(&self, ctx: Context, _ready: Ready) {
         if let Err(err) = register_guild_commands(&ctx, self.state.config.discord_guild_id).await {
             error!(?err, "failed to register discord commands");
         }
@@ -1241,22 +1240,14 @@ impl EventHandler for DiscordHandler {
                 }
             };
 
-        let bot_id = *self.bot_user_id.read().await;
-        let bot_id = match bot_id {
-            Some(id) => id,
-            None => {
-                warn!("bot user id not ready");
-                return;
-            }
-        };
+        info!(
+            channel_id = msg.channel_id.get(),
+            author_id = msg.author.id.get(),
+            "received discord message in managed thread"
+        );
 
-        let has_mention = msg.mentions.iter().any(|user| user.id.get() == bot_id);
-        if !has_mention {
-            return;
-        }
-
-        let stripped = strip_bot_mention(&msg.content, bot_id);
-        if stripped.is_empty() {
+        let content = normalize_line_message(&msg.content);
+        if content.is_empty() {
             let _ = msg
                 .channel_id
                 .send_message(
@@ -1276,8 +1267,8 @@ impl EventHandler for DiscordHandler {
             .label("送信")
             .style(ButtonStyle::Primary);
         let delete_button = CreateButton::new(BUTTON_DELETE_ID)
-            .emoji(ReactionType::Unicode("🗑️".to_string()))
-            .style(ButtonStyle::Secondary);
+            .label("キャンセル")
+            .style(ButtonStyle::Danger);
         let row = CreateActionRow::Buttons(vec![send_button, delete_button]);
 
         let message = CreateMessage::new()
@@ -1298,14 +1289,7 @@ impl EventHandler for DiscordHandler {
                 }
             }
             Interaction::Component(component) => {
-                if let Err(err) = handle_component_interaction(
-                    &ctx,
-                    &self.state,
-                    component,
-                    self.bot_user_id.clone(),
-                )
-                .await
-                {
+                if let Err(err) = handle_component_interaction(&ctx, &self.state, component).await {
                     error!(?err, "failed to handle component interaction");
                 }
             }

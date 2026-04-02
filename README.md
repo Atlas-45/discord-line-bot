@@ -2,6 +2,8 @@
 
 LINEのWebhookを受け取り、Discordのスレッドへ転送し、DiscordからLINEへ返信するためのRustサービスです。
 
+運用手順は [OPERATIONS.md](/Users/subaru/Desktop/文化祭「polaris」/Discord-Line/OPERATIONS.md) を参照してください。
+
 ## 主な機能
 
 - LINEメッセージをDiscordのスレッドへ転送（スレッド自動作成・再利用）
