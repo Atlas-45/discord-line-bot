@@ -1030,7 +1030,9 @@ async fn handle_command_interaction(
                 }
             };
 
-            delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
+            if command == "close" {
+                delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
+            }
 
             if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
                 warn!(?err, "failed to mark discord thread resolved");
@@ -1329,9 +1331,6 @@ async fn send_line_from_discord(
         match outcome {
             LineReplyOutcome::Sent => {
                 send_api_notice(state, thread_id, "reply").await?;
-                if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
-                    warn!(?err, "failed to mark discord thread resolved");
-                }
                 return Ok(());
             }
             LineReplyOutcome::InvalidToken => {
@@ -1343,9 +1342,6 @@ async fn send_line_from_discord(
 
     send_line_push(state, target, content).await?;
     send_api_notice(state, thread_id, push_method).await?;
-    if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
-        warn!(?err, "failed to mark discord thread resolved");
-    }
     Ok(())
 }
 
