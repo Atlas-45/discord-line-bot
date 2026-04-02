@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,27 +19,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serenity::async_trait;
 use serenity::builder::{
-    CreateActionRow,
-    CreateButton,
-    CreateCommand,
-    CreateInteractionResponse,
-    CreateInteractionResponseMessage,
-    CreateMessage,
+    CreateActionRow, CreateButton, CreateCommand, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateMessage,
 };
 use serenity::model::channel::ChannelType;
 use serenity::model::gateway::Ready;
 use serenity::model::prelude::{
-    ButtonStyle,
-    Channel,
-    ChannelId,
-    GuildId,
-    Interaction,
-    Message,
-    ReactionType,
+    ButtonStyle, Channel, ChannelId, GuildId, Interaction, Message, ReactionType,
 };
 use serenity::prelude::*;
 use sha2::Sha256;
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -57,9 +49,10 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let http = Client::new();
+    let db_options = SqliteConnectOptions::from_str(&config.database_url)?.create_if_missing(true);
     let db = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&config.database_url)
+        .connect_with(db_options)
         .await
         .context("connect to sqlite")?;
 
@@ -276,7 +269,15 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
         None => return Ok(()),
     };
 
-    let thread_id = ensure_discord_thread(&state, &source_type, &source_id, event.timestamp).await?;
+    let existing_thread_id = get_thread_id(&state.db, &source_type, &source_id).await?;
+    if !should_forward_to_discord(existing_thread_id.is_some(), &text) {
+        return Ok(());
+    }
+
+    let thread_id = match existing_thread_id {
+        Some(thread_id) => thread_id,
+        None => ensure_discord_thread(&state, &source_type, &source_id, event.timestamp).await?,
+    };
 
     if let Some(reply_token) = event.reply_token {
         store_reply_token(&state.db, thread_id, &reply_token).await?;
@@ -321,6 +322,10 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
     Ok(())
 }
 
+fn should_forward_to_discord(has_active_thread: bool, text: &str) -> bool {
+    has_active_thread || text.contains("質問")
+}
+
 async fn ensure_discord_thread(
     state: &AppState,
     source_type: &str,
@@ -344,7 +349,7 @@ async fn ensure_discord_thread(
 
     upsert_thread(&state.db, source_type, source_id, thread_id).await?;
 
-    let intro = format!("LINE source: {source_type}/{source_id}");
+    let intro = format!("LINE source: {source_type}");
     if let Err(err) = send_discord_message(state, thread_id, &intro).await {
         warn!(?err, "failed to send intro message to discord");
     }
@@ -400,9 +405,7 @@ fn truncate_discord_name(name: &str) -> String {
 fn strip_bot_mention(content: &str, bot_id: u64) -> String {
     let mention = format!("<@{bot_id}>");
     let mention_nick = format!("<@!{bot_id}>");
-    let cleaned = content
-        .replace(&mention, " ")
-        .replace(&mention_nick, " ");
+    let cleaned = content.replace(&mention, " ").replace(&mention_nick, " ");
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -543,11 +546,7 @@ async fn fetch_discord_channel_name(state: &AppState, channel_id: u64) -> Result
     Err(anyhow!("discord channel fetch error {status}: {body}"))
 }
 
-async fn update_discord_thread_name(
-    state: &AppState,
-    thread_id: u64,
-    name: &str,
-) -> Result<()> {
+async fn update_discord_thread_name(state: &AppState, thread_id: u64, name: &str) -> Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{thread_id}");
     let payload = json!({ "name": name });
     let response = state
@@ -998,18 +997,13 @@ async fn handle_command_interaction(
                     let message = CreateInteractionResponseMessage::new()
                         .content(":question: 不明なスレッド");
                     interaction
-                        .create_response(
-                            &ctx.http,
-                            CreateInteractionResponse::Message(message),
-                        )
+                        .create_response(&ctx.http, CreateInteractionResponse::Message(message))
                         .await?;
                     return Ok(());
                 }
             };
 
-            if command == "close" {
-                delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
-            }
+            delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
 
             if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
                 warn!(?err, "failed to mark discord thread resolved");
@@ -1085,20 +1079,21 @@ async fn handle_component_interaction(
         return Ok(());
     }
 
-    let thread_id = match resolve_thread_id(
-        ctx,
-        interaction.channel_id,
-        state.config.discord_channel_id,
-    )
-    .await?
-    {
-        Some(thread_id) => thread_id,
-        None => {
-            send_discord_channel_message(state, interaction.channel_id.get(), "不明なスレッドです。")
+    let thread_id =
+        match resolve_thread_id(ctx, interaction.channel_id, state.config.discord_channel_id)
+            .await?
+        {
+            Some(thread_id) => thread_id,
+            None => {
+                send_discord_channel_message(
+                    state,
+                    interaction.channel_id.get(),
+                    "不明なスレッドです。",
+                )
                 .await?;
-            return Ok(());
-        }
-    };
+                return Ok(());
+            }
+        };
 
     let Some(reference) = interaction.message.message_reference.as_ref() else {
         send_discord_channel_message(state, thread_id, "送信するメッセージを取得できません。")
@@ -1205,20 +1200,17 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let _thread_id = match resolve_thread_id(
-            &ctx,
-            msg.channel_id,
-            self.state.config.discord_channel_id,
-        )
-        .await
-        {
-            Ok(Some(thread_id)) => thread_id,
-            Ok(None) => return,
-            Err(err) => {
-                warn!(?err, "failed to resolve thread id");
-                return;
-            }
-        };
+        let _thread_id =
+            match resolve_thread_id(&ctx, msg.channel_id, self.state.config.discord_channel_id)
+                .await
+            {
+                Ok(Some(thread_id)) => thread_id,
+                Ok(None) => return,
+                Err(err) => {
+                    warn!(?err, "failed to resolve thread id");
+                    return;
+                }
+            };
 
         let bot_id = *self.bot_user_id.read().await;
         let bot_id = match bot_id {
@@ -1333,4 +1325,28 @@ async fn send_line_from_discord(
 async fn send_api_notice(state: &AppState, thread_id: u64, method: &str) -> Result<()> {
     let notice = format!("API: {method}");
     send_discord_channel_message(state, thread_id, &notice).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_forward_to_discord;
+
+    #[test]
+    fn starts_forwarding_when_question_keyword_appears() {
+        assert!(should_forward_to_discord(false, "質問"));
+        assert!(should_forward_to_discord(false, " 質問 "));
+        assert!(should_forward_to_discord(false, "これ質問です"));
+    }
+
+    #[test]
+    fn continues_forwarding_while_thread_is_active() {
+        assert!(should_forward_to_discord(true, "了解しました"));
+        assert!(should_forward_to_discord(true, "   "));
+    }
+
+    #[test]
+    fn ignores_non_question_before_thread_starts() {
+        assert!(!should_forward_to_discord(false, "了解しました"));
+        assert!(!should_forward_to_discord(false, "   "));
+    }
 }

@@ -79,6 +79,41 @@ cargo build
 cargo build --release
 ```
 
+## Dockerで起動
+
+Docker Compose で `app` と `Caddy` を一緒に立ち上げられます。
+
+1. `.env` を作成する
+2. `Caddyfile.docker` の `your-domain.example` を本番ドメインへ変更する
+3. 起動する
+
+```bash
+docker compose up -d --build
+```
+
+`ngrok` でWebhook確認をするときだけ、テスト用に `app` の `8080:8080` 公開を有効にしています。
+本番で不要なら [docker-compose.yml](/Users/subaru/Desktop/文化祭「polaris」/Discord-Line/docker-compose.yml) の `Test-only port mapping for ngrok/local webhook verification.` の箇所は外してください。
+
+停止:
+
+```bash
+docker compose down
+```
+
+ログ確認:
+
+```bash
+docker compose logs -f app
+docker compose logs -f caddy
+```
+
+補足:
+
+- SQLite は Docker volume `app-data` に保存されます
+- コンテナ内の待受は `0.0.0.0:8080` です
+- `Caddyfile.docker` は `app:8080` へ HTTPS リバースプロキシします
+- LINE Developers の Webhook URL は `https://<your-domain>/line/webhook` を設定してください
+
 ## サーバー反映
 
 ```bash

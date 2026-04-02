@@ -1,0 +1,37 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-line-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: sqlite:///data/data.sqlite
+      RUST_LOG: info
+    # Test-only port mapping for ngrok/local webhook verification.
+    ports:
+      - "8080:8080"
+    volumes:
+      - app-data:/data
+
+  caddy:
+    image: caddy:2
+    container_name: discord-line-caddy
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile.docker:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  app-data:
+  caddy-data:
+  caddy-config:

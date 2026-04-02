@@ -1,0 +1,7 @@
+target
+.cargo-target
+.cargo-home
+.git
+.gitignore
+.env
+data.sqlite

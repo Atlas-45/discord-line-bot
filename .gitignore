@@ -3,3 +3,5 @@ data.sqlite
 .env
 .DS_Store
 /Line78
+.cargo-home
+.cargo-target
