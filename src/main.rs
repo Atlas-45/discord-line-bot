@@ -150,6 +150,23 @@ struct AppState {
     db: SqlitePool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThreadStatus {
+    Unresolved,
+    Resolved,
+    Closed,
+}
+
+impl ThreadStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unresolved => "unresolved",
+            Self::Resolved => "resolved",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 async fn init_db(db: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS line_threads (
@@ -178,6 +195,16 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS processed_events (
             event_id TEXT PRIMARY KEY,
             received_at INTEGER NOT NULL
+        )",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS thread_statuses (
+            thread_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
         )",
     )
     .execute(db)
@@ -275,6 +302,8 @@ async fn process_line_event(state: Arc<AppState>, event: LineEvent) -> Result<()
         Some(thread_id) => thread_id,
         None => ensure_discord_thread(&state, &source_type, &source_id, event.timestamp).await?,
     };
+
+    set_thread_status(&state.db, thread_id, ThreadStatus::Unresolved).await?;
 
     if let Some(reply_token) = event.reply_token {
         store_reply_token(&state.db, thread_id, &reply_token).await?;
@@ -603,6 +632,7 @@ async fn mark_discord_thread_unresolved(state: &AppState, thread_id: u64) -> Res
 }
 
 async fn mark_discord_thread_resolved(state: &AppState, thread_id: u64) -> Result<()> {
+    set_thread_status(&state.db, thread_id, ThreadStatus::Resolved).await?;
     let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
         return Ok(());
     };
@@ -615,6 +645,7 @@ async fn mark_discord_thread_resolved(state: &AppState, thread_id: u64) -> Resul
 }
 
 async fn mark_discord_thread_closed(state: &AppState, thread_id: u64) -> Result<()> {
+    set_thread_status(&state.db, thread_id, ThreadStatus::Closed).await?;
     let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
         return Ok(());
     };
@@ -671,6 +702,43 @@ async fn upsert_thread(
     .await?;
 
     Ok(())
+}
+
+async fn set_thread_status(db: &SqlitePool, thread_id: u64, status: ThreadStatus) -> Result<()> {
+    let now = now_ts();
+    sqlx::query(
+        "INSERT INTO thread_statuses (thread_id, status, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET
+            status = excluded.status,
+            updated_at = excluded.updated_at",
+    )
+    .bind(thread_id.to_string())
+    .bind(status.as_str())
+    .bind(now)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn get_thread_status(db: &SqlitePool, thread_id: u64) -> Result<Option<ThreadStatus>> {
+    let record = sqlx::query("SELECT status FROM thread_statuses WHERE thread_id = ?")
+        .bind(thread_id.to_string())
+        .fetch_optional(db)
+        .await?;
+
+    let status = match record {
+        Some(row) => match row.try_get::<String, _>("status")?.as_str() {
+            "unresolved" => Some(ThreadStatus::Unresolved),
+            "resolved" => Some(ThreadStatus::Resolved),
+            "closed" => Some(ThreadStatus::Closed),
+            _ => None,
+        },
+        None => None,
+    };
+
+    Ok(status)
 }
 
 async fn store_reply_token(db: &SqlitePool, thread_id: u64, reply_token: &str) -> Result<()> {
@@ -1060,7 +1128,8 @@ async fn handle_command_interaction(
                 if thread.parent_id != Some(parent_id) {
                     continue;
                 }
-                if !is_unresolved_thread_name(&thread.name) {
+                let status = get_thread_status(&state.db, thread.id.get()).await?;
+                if status != Some(ThreadStatus::Unresolved) {
                     continue;
                 }
                 unresolved.push(format!("<#{}>", thread.id.get()));
