@@ -29,6 +29,7 @@ use serenity::prelude::*;
 use sha2::Sha256;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
+use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
@@ -597,26 +598,58 @@ async fn fetch_discord_channel_name(state: &AppState, channel_id: u64) -> Result
 }
 
 async fn update_discord_thread_name(state: &AppState, thread_id: u64, name: &str) -> Result<()> {
-    let url = format!("https://discord.com/api/v10/channels/{thread_id}");
-    let payload = json!({ "name": name });
-    let response = state
-        .http
-        .patch(url)
-        .header(
-            "Authorization",
-            format!("Bot {}", state.config.discord_bot_token),
-        )
-        .json(&payload)
-        .send()
-        .await?;
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        let url = format!("https://discord.com/api/v10/channels/{thread_id}");
+        let payload = json!({ "name": name });
+        let response = state
+            .http
+            .patch(url)
+            .header(
+                "Authorization",
+                format!("Bot {}", state.config.discord_bot_token),
+            )
+            .json(&payload)
+            .send()
+            .await;
 
-    if response.status().is_success() {
-        return Ok(());
+        match response {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    if let Ok(rate_limit) = serde_json::from_str::<DiscordRateLimitResponse>(&body)
+                    {
+                        if rate_limit.retry_after <= 2.0 && attempt < 3 {
+                            warn!(
+                                thread_id,
+                                attempt,
+                                retry_after = rate_limit.retry_after,
+                                "discord thread rename rate limited, retrying"
+                            );
+                            sleep(Duration::from_secs_f64(rate_limit.retry_after)).await;
+                            continue;
+                        }
+                        return Err(anyhow!(
+                            "discord thread update rate limited; retry_after={}",
+                            rate_limit.retry_after
+                        ));
+                    }
+                }
+                last_err = Some(anyhow!("discord thread update error {status}: {body}"));
+            }
+            Err(err) => {
+                last_err = Some(err.into());
+            }
+        }
+
+        if attempt < 3 {
+            sleep(Duration::from_millis(300)).await;
+        }
     }
 
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(anyhow!("discord thread update error {status}: {body}"))
+    Err(last_err.unwrap_or_else(|| anyhow!("discord thread update failed")))
 }
 
 async fn mark_discord_thread_unresolved(state: &AppState, thread_id: u64) -> Result<()> {
@@ -632,29 +665,34 @@ async fn mark_discord_thread_unresolved(state: &AppState, thread_id: u64) -> Res
 }
 
 async fn mark_discord_thread_resolved(state: &AppState, thread_id: u64) -> Result<()> {
-    set_thread_status(&state.db, thread_id, ThreadStatus::Resolved).await?;
     let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
         return Ok(());
     };
     let next = truncate_discord_name(&mark_resolved_name(&current_name));
-    if current_name == next {
-        return Ok(());
+    if current_name != next {
+        update_discord_thread_name(state, thread_id, &next).await?;
     }
-    update_discord_thread_name(state, thread_id, &next).await?;
+    set_thread_status(&state.db, thread_id, ThreadStatus::Resolved).await?;
     Ok(())
 }
 
 async fn mark_discord_thread_closed(state: &AppState, thread_id: u64) -> Result<()> {
-    set_thread_status(&state.db, thread_id, ThreadStatus::Closed).await?;
     let Some(current_name) = fetch_discord_channel_name(state, thread_id).await? else {
         return Ok(());
     };
     let next = truncate_discord_name(&mark_closed_name(&current_name));
-    if current_name == next {
-        return Ok(());
+    if current_name != next {
+        update_discord_thread_name(state, thread_id, &next).await?;
     }
-    update_discord_thread_name(state, thread_id, &next).await?;
+    set_thread_status(&state.db, thread_id, ThreadStatus::Closed).await?;
     Ok(())
+}
+
+fn parse_retry_after_seconds(err: &anyhow::Error) -> Option<f64> {
+    let prefix = "discord thread update rate limited; retry_after=";
+    err.to_string()
+        .strip_prefix(prefix)
+        .and_then(|value| value.parse::<f64>().ok())
 }
 
 fn parse_discord_id(id: &str) -> Result<u64> {
@@ -1023,6 +1061,11 @@ struct DiscordChannelResponse {
 }
 
 #[derive(Deserialize)]
+struct DiscordRateLimitResponse {
+    retry_after: f64,
+}
+
+#[derive(Deserialize)]
 struct DiscordMessageResponse {
     id: String,
 }
@@ -1104,17 +1147,33 @@ async fn handle_command_interaction(
                 }
             };
 
-            if command == "close" {
-                delete_thread_mapping_by_thread_id(&state.db, thread_id).await?;
-                if let Err(err) = mark_discord_thread_closed(state, thread_id).await {
-                    warn!(?err, "failed to mark discord thread closed");
+            let result = if command == "close" {
+                match mark_discord_thread_closed(state, thread_id).await {
+                    Ok(()) => delete_thread_mapping_by_thread_id(&state.db, thread_id).await,
+                    Err(err) => Err(err),
                 }
-            } else if let Err(err) = mark_discord_thread_resolved(state, thread_id).await {
-                warn!(?err, "failed to mark discord thread resolved");
-            }
+            } else {
+                mark_discord_thread_resolved(state, thread_id).await
+            };
 
-            let message =
-                CreateInteractionResponseMessage::new().content(":white_check_mark: 完了");
+            let message = match result {
+                Ok(()) => {
+                    CreateInteractionResponseMessage::new().content(":white_check_mark: 完了")
+                }
+                Err(err) => {
+                    warn!(?err, command, thread_id, "failed to update thread status");
+                    let content = if let Some(seconds) = parse_retry_after_seconds(&err) {
+                        format!(
+                            ":warning: Discordのレート制限中です。約{}秒後にもう一度実行してください。",
+                            seconds.ceil() as u64
+                        )
+                    } else {
+                        ":warning: スレッド名の更新に失敗しました。もう一度実行してください。"
+                            .to_string()
+                    };
+                    CreateInteractionResponseMessage::new().content(content)
+                }
+            };
             interaction
                 .create_response(&ctx.http, CreateInteractionResponse::Message(message))
                 .await?;
